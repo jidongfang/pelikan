@@ -1,6 +1,8 @@
 #include <storage/cuckoo/item.h>
 #include <storage/cuckoo/cuckoo.h>
 
+#include <time/time.h>
+
 #include <cc_bstring.h>
 #include <cc_mm.h>
 
@@ -17,6 +19,7 @@ void test_insert_collision(uint32_t policy, bool cas);
 void test_cas(uint32_t policy);
 void test_delete_basic(uint32_t policy, bool cas);
 void test_expire_basic(uint32_t policy, bool cas);
+void test_expire_truncated(uint32_t policy, bool cas);
 
 cuckoo_options_st options = { CUCKOO_OPTION(OPTION_INIT) };
 cuckoo_metrics_st metrics = { CUCKOO_METRIC(METRIC_INIT) };
@@ -25,11 +28,12 @@ cuckoo_metrics_st metrics = { CUCKOO_METRIC(METRIC_INIT) };
  * utilities
  */
 static void
-test_setup(uint32_t policy, bool cas)
+test_setup(uint32_t policy, bool cas, delta_time_i ttl)
 {
     option_load_default((struct option *)&options, OPTION_CARDINALITY(options));
     options.cuckoo_policy.val.vuint = policy;
     options.cuckoo_item_cas.val.vbool = cas;
+    options.cuckoo_max_ttl.val.vuint = ttl;
 
     cuckoo_setup(&options, &metrics);
 }
@@ -41,10 +45,10 @@ test_teardown(void)
 }
 
 static void
-test_reset(uint32_t policy, bool cas)
+test_reset(uint32_t policy, bool cas, delta_time_i ttl)
 {
     test_teardown();
-    test_setup(policy, cas);
+    test_setup(policy, cas, ttl);
 }
 
 /**
@@ -60,17 +64,15 @@ test_insert_basic(uint32_t policy, bool cas)
     struct val val;
     struct item *it;
 
-    test_reset(policy, cas);
+    test_reset(policy, cas, CUCKOO_MAX_TTL);
 
-    key.data = KEY;
-    key.len = sizeof(KEY) - 1;
+    bstring_set_literal(&key, KEY);
 
     val.type = VAL_TYPE_STR;
-    val.vstr.data = VAL;
-    val.vstr.len = sizeof(VAL) - 1;
+    bstring_set_literal(&val.vstr, VAL);
 
     time_update();
-    it = cuckoo_insert(&key, &val, UINT32_MAX - 1);
+    it = cuckoo_insert(&key, &val, INT32_MAX);
     ck_assert_msg(it != NULL, "cuckoo_insert not OK");
 
     it = cuckoo_get(&key);
@@ -94,7 +96,7 @@ test_insert_collision(uint32_t policy, bool cas)
     char keystring[CC_UINTMAX_MAXLEN];
     uint64_t i, testval;
 
-    test_reset(policy, cas);
+    test_reset(policy, cas, CUCKOO_MAX_TTL);
 
     time_update();
     for (i = 0; i < CUCKOO_NITEM + 1; i++) {
@@ -104,7 +106,7 @@ test_insert_collision(uint32_t policy, bool cas)
         val.type = VAL_TYPE_INT;
         val.vint = i;
 
-        it = cuckoo_insert(&key, &val, UINT32_MAX - 1);
+        it = cuckoo_insert(&key, &val, INT32_MAX);
         ck_assert_msg(it != NULL, "cuckoo_insert not OK");
     }
 
@@ -138,27 +140,24 @@ test_cas(uint32_t policy)
     struct item *it;
     uint64_t cas1, cas2;
 
-    test_reset(policy, true);
+    test_reset(policy, true, CUCKOO_MAX_TTL);
 
-    key.data = KEY;
-    key.len = sizeof(KEY) - 1;
+    bstring_set_literal(&key, KEY);
 
     val.type = VAL_TYPE_STR;
-    val.vstr.data = VAL;
-    val.vstr.len = sizeof(VAL) - 1;
+    bstring_set_literal(&val.vstr, VAL);
 
     time_update();
-    it = cuckoo_insert(&key, &val, UINT32_MAX - 1);
+    it = cuckoo_insert(&key, &val, INT32_MAX);
     ck_assert_msg(it != NULL, "cuckoo_insert not OK");
 
     it = cuckoo_get(&key);
     cas1 = item_cas(it);
     ck_assert_uint_ne(cas1, 0);
 
-    val.vstr.data = VAL2;
-    val.vstr.len = sizeof(VAL2) - 1;
+    bstring_set_literal(&val.vstr, VAL);
 
-    status = cuckoo_update(it, &val, UINT32_MAX - 1);
+    status = cuckoo_update(it, &val, INT32_MAX);
     ck_assert_msg(status == CC_OK, "cuckoo_update not OK - return status %d",
             status);
 
@@ -181,17 +180,15 @@ test_delete_basic(uint32_t policy, bool cas)
     struct item *it;
     bool deleted;
 
-    test_reset(policy, cas);
+    test_reset(policy, cas, CUCKOO_MAX_TTL);
 
-    key.data = KEY;
-    key.len = sizeof(KEY) - 1;
+    bstring_set_literal(&key, KEY);
 
     val.type = VAL_TYPE_STR;
-    val.vstr.data = VAL;
-    val.vstr.len = sizeof(VAL) - 1;
+    bstring_set_literal(&val.vstr, VAL);
 
     time_update();
-    it = cuckoo_insert(&key, &val, UINT32_MAX - 1);
+    it = cuckoo_insert(&key, &val, INT32_MAX);
     ck_assert_msg(it != NULL, "cuckoo_insert not OK");
 
     it = cuckoo_get(&key);
@@ -214,34 +211,69 @@ test_expire_basic(uint32_t policy, bool cas)
 {
 #define KEY "key"
 #define VAL "value"
-#define NOW 12345678
+#define TIME 12345678
     struct bstring key;
     struct val val;
     struct item *it;
 
-    test_reset(policy, cas);
+    test_reset(policy, cas, CUCKOO_MAX_TTL);
 
-    key.data = KEY;
-    key.len = sizeof(KEY) - 1;
+    bstring_set_literal(&key, KEY);
 
     val.type = VAL_TYPE_STR;
-    val.vstr.data = VAL;
-    val.vstr.len = sizeof(VAL) - 1;
+    bstring_set_literal(&val.vstr, VAL);
 
-    now = NOW;
-    it = cuckoo_insert(&key, &val, NOW + 1);
+    proc_sec = TIME;
+    it = cuckoo_insert(&key, &val, TIME + 1);
     ck_assert_msg(it != NULL, "cuckoo_insert not OK");
 
     it = cuckoo_get(&key);
     ck_assert_msg(it != NULL, "cuckoo_get returned NULL");
 
-    now += 2;
+    proc_sec += 2;
 
     it = cuckoo_get(&key);
     ck_assert_msg(it == NULL, "cuckoo_get returned not NULL after expiration");
-#undef NOW
+#undef TIME
 #undef KEY
 #undef VAL
+}
+
+void
+test_expire_truncated(uint32_t policy, bool cas)
+{
+#define KEY "key"
+#define VAL "value"
+#define TIME 12345678
+#define TTL_MAX 10
+#define TTL_LONG (TTL_MAX + 5)
+    struct bstring key;
+    struct val val;
+    struct item *it;
+
+    test_reset(policy, cas, TTL_MAX);
+
+    bstring_set_literal(&key, KEY);
+
+    val.type = VAL_TYPE_STR;
+    bstring_set_literal(&val.vstr, VAL);
+
+    proc_sec = TIME;
+    it = cuckoo_insert(&key, &val, TIME + TTL_LONG);
+    ck_assert_msg(it != NULL, "cuckoo_insert not OK");
+
+    it = cuckoo_get(&key);
+    ck_assert_msg(it != NULL, "cuckoo_get returned NULL");
+
+    proc_sec += (TTL_MAX + 2);
+
+    it = cuckoo_get(&key);
+    ck_assert_msg(it == NULL, "cuckoo_get returned not NULL after enforced max expiration");
+#undef KEY
+#undef VAL
+#undef TIME
+#undef TTL_MAX
+#undef TTL_LONG
 }
 
 START_TEST(test_insert_basic_random_true)
@@ -316,9 +348,21 @@ START_TEST(test_expire_basic_random_false)
 }
 END_TEST
 
+START_TEST(test_expire_truncated_random_true)
+{
+    test_expire_truncated(CUCKOO_POLICY_RANDOM, true);
+}
+END_TEST
+
+START_TEST(test_expire_truncated_random_false)
+{
+    test_expire_truncated(CUCKOO_POLICY_RANDOM, false);
+}
+END_TEST
+
 START_TEST(test_insert_replace_expired)
 {
-#define NOW 12345678
+#define TIME 12345678
 
     struct bstring key;
     struct val val;
@@ -326,9 +370,9 @@ START_TEST(test_insert_replace_expired)
     uint64_t i;
 
     metrics = (cuckoo_metrics_st) { CUCKOO_METRIC(METRIC_INIT) };
-    test_reset(CUCKOO_POLICY_EXPIRE, true);
+    test_reset(CUCKOO_POLICY_EXPIRE, true, CUCKOO_MAX_TTL);
 
-    now = NOW;
+    proc_sec = TIME;
     for (i = 0; metrics.item_curr.counter < CUCKOO_NITEM; i++) {
         key.len = sprintf(keystring, "%"PRIu64, i);
         key.data = keystring;
@@ -336,28 +380,28 @@ START_TEST(test_insert_replace_expired)
         val.type = VAL_TYPE_INT;
         val.vint = i;
 
-        ck_assert_msg(cuckoo_insert(&key, &val, now + 1) != NULL,
+        ck_assert_msg(cuckoo_insert(&key, &val, proc_sec + 1) != NULL,
                 "cuckoo_insert not OK");
     }
 
-    // dict is full, all items will expire in now + 1
-    now += 2;
+    // dict is full, all items will expire in proc_sec + 1
+    proc_sec += 2;
     key.len = sprintf(keystring, "%"PRIu64, i);
     key.data = keystring;
 
     val.type = VAL_TYPE_INT;
     val.vint = i;
 
-    ck_assert_msg(cuckoo_insert(&key, &val, now + 1) != NULL,
+    ck_assert_msg(cuckoo_insert(&key, &val, proc_sec + 1) != NULL,
                 "cuckoo_insert failed");
     ck_assert_int_eq(metrics.item_expire.counter, 1);
-#undef NOW
+#undef TIME
 }
 END_TEST
 
 START_TEST(test_insert_insert_expire_swap)
 {
-#define NOW 12345678
+#define TIME 12345678
     struct bstring key;
     struct val val;
     char keystring[30];
@@ -365,9 +409,9 @@ START_TEST(test_insert_insert_expire_swap)
     int hits = 0;
 
     metrics = (cuckoo_metrics_st) { CUCKOO_METRIC(METRIC_INIT) };
-    test_reset(CUCKOO_POLICY_EXPIRE, false);
+    test_reset(CUCKOO_POLICY_EXPIRE, false, CUCKOO_MAX_TTL);
 
-    now = NOW;
+    proc_sec = TIME;
     for (i = 0; metrics.item_curr.counter < CUCKOO_NITEM; i++) {
         key.len = sprintf(keystring, "%"PRIu64, i);
         key.data = keystring;
@@ -375,7 +419,7 @@ START_TEST(test_insert_insert_expire_swap)
         val.type = VAL_TYPE_INT;
         val.vint = i;
 
-        ck_assert_msg(cuckoo_insert(&key, &val, now + i) != NULL,
+        ck_assert_msg(cuckoo_insert(&key, &val, proc_sec + i) != NULL,
                 "cuckoo_insert not OK");
     }
 
@@ -385,7 +429,7 @@ START_TEST(test_insert_insert_expire_swap)
     val.type = VAL_TYPE_INT;
     val.vint = i;
 
-    ck_assert_msg(cuckoo_insert(&key, &val, now + i) != NULL,
+    ck_assert_msg(cuckoo_insert(&key, &val, proc_sec + i) != NULL,
             "cuckoo_insert not OK");
 
     for (;i > 0 && hits < CUCKOO_NITEM;i--) {
@@ -395,7 +439,7 @@ START_TEST(test_insert_insert_expire_swap)
     }
     ck_assert_msg(hits == CUCKOO_NITEM, "expected %d hits, got %d",
             CUCKOO_NITEM, hits);
-#undef NOW
+#undef TIME
 }
 END_TEST
 /*
@@ -410,7 +454,7 @@ cuckoo_suite(void)
     TCase *tc_basic_req = tcase_create("basic item api");
     suite_add_tcase(s, tc_basic_req);
 
-    test_setup(CUCKOO_POLICY_RANDOM, true);
+    test_setup(CUCKOO_POLICY_RANDOM, true, CUCKOO_MAX_TTL);
 
     tcase_add_test(tc_basic_req, test_insert_basic_random_true);
     tcase_add_test(tc_basic_req, test_insert_basic_random_false);
@@ -424,6 +468,8 @@ cuckoo_suite(void)
     tcase_add_test(tc_basic_req, test_delete_basic_random_false);
     tcase_add_test(tc_basic_req, test_expire_basic_random_true);
     tcase_add_test(tc_basic_req, test_expire_basic_random_false);
+    tcase_add_test(tc_basic_req, test_expire_truncated_random_true);
+    tcase_add_test(tc_basic_req, test_expire_truncated_random_false);
     tcase_add_test(tc_basic_req, test_insert_replace_expired);
     tcase_add_test(tc_basic_req, test_insert_insert_expire_swap);
 

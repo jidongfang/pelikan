@@ -1,5 +1,6 @@
 #include "process.h"
 
+#include "hotkey/hotkey.h"
 #include "protocol/data/memcache_include.h"
 #include "storage/cuckoo/cuckoo.h"
 
@@ -67,6 +68,10 @@ _get_key(struct response *rsp, struct bstring *key)
             rsp->vint = val.vint;
         } else {
             rsp->vstr = val.vstr;
+        }
+
+        if (hotkey_enabled && hotkey_sample(key)) {
+            log_debug("hotkey detected: %.*s", key->len, key->data);
         }
 
         log_verb("found key at %p, location %p", key, it);
@@ -181,14 +186,14 @@ static void
 _process_set(struct response *rsp, struct request *req)
 {
     rstatus_i status = CC_OK;
-    rel_time_t expire;
+    proc_time_i expire;
     struct bstring *key;
     struct item *it;
     struct val val;
 
     INCR(process_metrics, set);
     key = array_first(req->keys);
-    expire = time_reltime(req->expiry);
+    expire = time_convert_proc_sec((time_i)req->expiry);
     _get_value(&val, &req->vstr);
 
     it = cuckoo_get(key);
@@ -198,7 +203,7 @@ _process_set(struct response *rsp, struct request *req)
         it = cuckoo_insert(key, &val, expire);
     }
 
-    if (it != NULL) {
+    if (it != NULL && status == CC_OK) {
         rsp->type = RSP_STORED;
         INCR(process_metrics, set_stored);
     } else {
@@ -224,7 +229,8 @@ _process_add(struct response *rsp, struct request *req)
         INCR(process_metrics, add_notstored);
     } else {
         _get_value(&val, &req->vstr);
-        if (cuckoo_insert(key, &val, time_reltime(req->expiry)) != NULL) {
+        if (cuckoo_insert(key, &val, time_convert_proc_sec((time_i)req->expiry))
+                != NULL) {
             rsp->type = RSP_STORED;
             INCR(process_metrics, add_stored);
         } else {
@@ -248,7 +254,8 @@ _process_replace(struct response *rsp, struct request *req)
     it = cuckoo_get(key);
     if (it != NULL) {
         _get_value(&val, &req->vstr);
-        if (cuckoo_update(it, &val, time_reltime(req->expiry)) == CC_OK) {
+        if (cuckoo_update(it, &val, time_convert_proc_sec((time_i)req->expiry))
+                == CC_OK) {
             rsp->type = RSP_STORED;
             INCR(process_metrics, replace_stored);
         } else {
@@ -277,7 +284,8 @@ _process_cas(struct response *rsp, struct request *req)
 
         if (item_cas_valid(it, req->vcas)) {
             _get_value(&val, &req->vstr);
-            if (cuckoo_update(it, &val, time_reltime(req->expiry)) == CC_OK) {
+            if (cuckoo_update(it, &val, time_convert_proc_sec((time_i)req->expiry))
+                    == CC_OK) {
                 rsp->type = RSP_STORED;
                 INCR(process_metrics, cas_stored);
             } else {
@@ -445,10 +453,16 @@ _cleanup(struct request **req, struct response **rsp)
     response_return_all(rsp);
 }
 
+static inline void
+_cleanup_req(struct request **req)
+{
+    request_return(req);
+}
+
 int
 slimcache_process_read(struct buf **rbuf, struct buf **wbuf, void **data)
 {
-    parse_rstatus_t status;
+    parse_rstatus_e status;
     struct request *req;
     struct response *rsp = NULL;
 
@@ -477,6 +491,7 @@ slimcache_process_read(struct buf **rbuf, struct buf **wbuf, void **data)
         if (status == PARSE_EUNFIN || req->partial) { /* ignore partial */
             (*rbuf)->rpos = old_rpos;
             buf_lshift(*rbuf);
+            _cleanup_req(&req);
             return 0;
         }
         if (status != PARSE_OK) {

@@ -57,6 +57,7 @@ teardown(void)
     process_teardown();
     slab_teardown();
     klog_teardown();
+    hotkey_teardown();
     compose_teardown();
     parse_teardown();
     response_teardown();
@@ -66,6 +67,7 @@ teardown(void)
 
     timing_wheel_teardown();
     tcp_teardown();
+    stats_log_teardown();
     sockio_teardown();
     event_teardown();
     dbuf_teardown();
@@ -108,17 +110,19 @@ setup(void)
     dbuf_setup(&setting.dbuf, &stats.dbuf);
     event_setup(&stats.event);
     sockio_setup(&setting.sockio, &stats.sockio);
+    stats_log_setup(&setting.stats_log);
     tcp_setup(&setting.tcp, &stats.tcp);
     timing_wheel_setup(&stats.timing_wheel);
 
     /* setup pelikan modules */
-    time_setup();
+    time_setup(&setting.time);
     procinfo_setup(&stats.procinfo);
     request_setup(&setting.request, &stats.request);
     response_setup(&setting.response, &stats.response);
     parse_setup(&stats.parse_req, NULL);
     compose_setup(NULL, &stats.compose_rsp);
     klog_setup(&setting.klog, &stats.klog);
+    hotkey_setup(&setting.hotkey);
     slab_setup(&setting.slab, &stats.slab);
     process_setup(&setting.process, &stats.process);
     admin_process_setup();
@@ -136,6 +140,12 @@ setup(void)
     intvl = option_uint(&setting.twemcache.klog_intvl);
     if (core_admin_register(intvl, klog_flush, NULL) == NULL) {
         log_error("Could not register timed event to flush command log");
+        goto error;
+    }
+
+    intvl = option_uint(&setting.twemcache.stats_intvl);
+    if (core_admin_register(intvl, stats_dump, NULL) == NULL) {
+        log_error("Could not register timed event to dump stats");
         goto error;
     }
 
@@ -192,6 +202,9 @@ main(int argc, char **argv)
         log_stderr("failed to load default option values");
         exit(EX_CONFIG);
     }
+
+    /* set the default time type to memcached before loading config */
+    setting.time.time_type.val.vuint = TIME_MEMCACHE;
 
     if (fp != NULL) {
         log_stderr("load config from %s", argv[1]);

@@ -3,8 +3,7 @@
 #include "core/context.h"
 #include "shared.h"
 
-#include <time/time.h>
-#include <util/util.h>
+#include "util/util.h"
 
 #include <cc_debug.h>
 #include <cc_event.h>
@@ -18,12 +17,21 @@
 #include <string.h>
 #include <sysexits.h>
 
+#ifdef USE_EVENT_FD
+#include <sys/eventfd.h>
+#endif
+
 #define SERVER_MODULE_NAME "core::server"
 
-#define SLEEP_CONN_USEC 10000 /* sleep for 10ms on out-of-stream-object error */
-
-struct pipe_conn *pipe_c = NULL;
-struct ring_array *conn_arr = NULL;
+#ifdef USE_EVENT_FD
+int efd_server_to_worker = -1;       /* server(w) -> worker(r) */
+int efd_worker_to_server = -1;       /* worker(w) -> server(r) */
+#else
+struct pipe_conn *pipe_new = NULL;   /* server(w) -> worker(r) */
+struct pipe_conn *pipe_term = NULL;  /* worker(w) -> server(r) */
+#endif
+struct ring_array *conn_new = NULL;  /* server(w) -> worker(r) */
+struct ring_array *conn_term = NULL; /* worker(w) -> server(r) */
 
 static server_metrics_st *server_metrics = NULL;
 
@@ -35,6 +43,13 @@ static channel_handler_st *hdl = &handlers;
 
 static struct addrinfo *server_ai;
 static struct buf_sock *server_sock; /* server buf_sock */
+
+/* Note: server thread currently owns the stream (buf_sock) pool. Other threads
+ * either need to get the connection from server (the case for worker thread) or
+ * have to directly create their own, instead of borrowing (the case for admin
+ * thread), to avoid concurrency issues around pooling operations, which are not
+ * thread-safe.
+ */
 
 static inline void
 _server_close(struct buf_sock *s)
@@ -48,22 +63,81 @@ _server_close(struct buf_sock *s)
 }
 
 static inline void
-_server_pipe_write(void)
+_server_write_notification(void)
 {
-    ASSERT(pipe_c != NULL);
+#ifdef USE_EVENT_FD
+    ASSERT(efd_server_to_worker != -1);
 
-    ssize_t status = pipe_send(pipe_c, "", 1);
+    uint64_t u = 1;
+    ssize_t status = write(efd_server_to_worker, &u, sizeof(uint64_t));
+
+    if (status == CC_EAGAIN) {
+        /* retry write */
+        log_verb("server core: retry write to eventfd");
+        event_add_write(ctx->evb, efd_server_to_worker, NULL);
+    } else if (status == CC_ERROR) {
+        log_error("could not write to eventfd - %d", status);
+    }
+#else
+    ASSERT(pipe_new != NULL);
+
+    ssize_t status = pipe_send(pipe_new, "", 1);
 
     if (status == 0 || status == CC_EAGAIN) {
         /* retry write */
         log_verb("server core: retry send on pipe");
-        event_add_write(ctx->evb, pipe_write_id(pipe_c), NULL);
+        event_add_write(ctx->evb, pipe_write_id(pipe_new), NULL);
     } else if (status == CC_ERROR) {
-        /* other reasn write can't be done */
-        log_error("could not write to pipe - %s", strerror(pipe_c->err));
+        log_error("could not write to pipe - %s", strerror(pipe_new->err));
     }
+#endif
+}
 
-    /* else, pipe write succeeded and no action needs to be taken */
+/* pipe_read recycles returned streams from worker thread */
+static inline void
+_server_read_notification(void)
+{
+#ifdef USE_EVENT_FD
+    ASSERT(efd_worker_to_server != -1);
+
+    uint64_t i;
+#else
+    ASSERT(pipe_term != NULL);
+
+    char buf[RING_ARRAY_DEFAULT_CAP]; /* buffer for discarding pipe data */
+    int i;
+#endif
+
+    struct buf_sock *s;
+    rstatus_i status;
+
+#ifdef USE_EVENT_FD
+    int rc = read(efd_worker_to_server, &i, sizeof(uint64_t));
+    if (rc < 0) {
+        log_warn("not adding new connections due to eventfd error");
+        return;
+    }
+#else
+    i = pipe_recv(pipe_term, buf, RING_ARRAY_DEFAULT_CAP);
+    if (i < 0) { /* errors, do not read from ring array */
+        log_warn("not reclaiming connections due to pipe error");
+        return;
+    }
+#endif
+
+    /* each byte in the pipe corresponds to a connection in the array */
+    for (; i > 0; --i) {
+        status = ring_array_pop(&s, conn_term);
+        if (status != CC_OK) {
+            log_warn("event number does not match conn queue: missing %d conns",
+                    i);
+            return;
+        }
+        log_verb("Recycling buf_sock %p from worker thread", s);
+        hdl->term(s->ch);
+        buf_sock_reset(s);
+        buf_sock_return(&s);
+    }
 }
 
 /* returns true if a connection is present, false if no more pending */
@@ -106,25 +180,31 @@ _tcp_accept(struct buf_sock *ss)
          * Timed sleep is easy to implement but a little inflexible; conditional
          * sleep is the smartest option but requires cross-thread communication.
          *
-         * Twemcache enables/disables event on the listening port dinamically,
+         * Twemcache enables/disables event on the listening port dynamically,
          * but the handling is not really thread-safe.
          */
         log_error("establish connection failed: cannot allocate buf_sock, "
                 "reject connection request");
         ss->hdl->reject(sc); /* server rejects connection by closing it */
-        usleep(SLEEP_CONN_USEC);
         return false;
     }
 
     if (!ss->hdl->accept(sc, s->ch)) {
+        buf_sock_reset(s);
         buf_sock_return(&s);
         return false;
     }
 
     /* push buf_sock to queue */
-    ring_array_push(&s, conn_arr);
+    if (ring_array_push(&s, conn_new) != CC_OK) { /* close if can't enqueue */
+        log_error("new connection queue is full, closing connection");
+        buf_sock_reset(s);
+        buf_sock_return(&s);
+        return false;
+    }
 
-    _server_pipe_write();
+    /* notify worker, note this may fail and will be retried via write event */
+    _server_write_notification();
 
     return true;
 }
@@ -143,30 +223,34 @@ static void
 _server_event(void *arg, uint32_t events)
 {
     struct buf_sock *s = arg;
+    log_verb("server event %06"PRIX32" with data %p", events, s);
 
-    log_verb("server event %06"PRIX32" on buf_sock %p", events, s);
-
-    if (events & EVENT_ERR) {
-        INCR(server_metrics, server_event_error);
-        _server_close(s);
-
-        return;
-    }
-
-    if (events & EVENT_READ) {
-        log_verb("processing server read event on buf_sock %p", s);
-
-        INCR(server_metrics, server_event_read);
-        _server_event_read(s);
-    }
-
-    if (events & EVENT_WRITE) {
-        /* the only server write event is write on pipe */
-
-        log_verb("processing server write event");
-        _server_pipe_write();
-
-        INCR(server_metrics, server_event_write);
+    if (s == NULL) { /* event on pipe */
+        if (events & EVENT_READ) { /* terminating connection from worker */
+            log_verb("processing server read event on pipe");
+            INCR(server_metrics, server_event_read);
+            _server_read_notification();
+        }
+        if (events & EVENT_WRITE) { /* retrying worker notification */
+            log_verb("processing server write event on pipe");
+            INCR(server_metrics, server_event_write);
+            _server_write_notification();
+        }
+        if (events & EVENT_ERR) {
+            log_debug("processing server error event on pipe");
+            INCR(server_metrics, server_event_error);
+        }
+    } else { /* event on listening socket */
+        if (events & EVENT_READ) {
+            log_verb("processing server read event on buf_sock %p", s);
+            INCR(server_metrics, server_event_read);
+            _server_event_read(s);
+        }
+        if (events & EVENT_ERR) { /* effectively refusing new conn */
+            /* TODO: shall we retry bind and listen ? */
+            log_debug("processing server error event on listening socket");
+            _server_close(s);
+        }
     }
 }
 
@@ -196,22 +280,53 @@ core_server_setup(server_options_st *options, server_metrics_st *metrics)
     }
 
     /* setup shared data structures between server and worker */
-    pipe_c = pipe_conn_create();
-    if (pipe_c == NULL) {
+#ifdef USE_EVENT_FD
+    efd_server_to_worker = eventfd(0 /* intval */, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (efd_server_to_worker < 0) {
+        int err = errno;
+        log_error("Could not create event fd %s, abort", strerror(err));
+        goto error;
+    }
+    efd_worker_to_server = eventfd(0 /* intval */, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (efd_worker_to_server < 0) {
+        int err = errno;
+        log_error("Could not create event fd %s, abort", strerror(err));
+        goto error;
+    }
+#else
+    pipe_new = pipe_conn_create();
+    if (pipe_new == NULL) {
+        log_error("Could not create connection for pipe, abort");
+        goto error;
+    }
+    pipe_term = pipe_conn_create();
+    if (pipe_term == NULL) {
         log_error("Could not create connection for pipe, abort");
         goto error;
     }
 
-    if (!pipe_open(NULL, pipe_c)) {
-        log_error("Could not open pipe connection: %s", strerror(pipe_c->err));
+    if (!pipe_open(NULL, pipe_new)) {
+        log_error("Could not open pipe for new connection: %s",
+                strerror(pipe_new->err));
+        goto error;
+    }
+    if (!pipe_open(NULL, pipe_term)) {
+        log_error("Could not open pipe for terminated connection: %s",
+                strerror(pipe_term->err));
         goto error;
     }
 
-    pipe_set_nonblocking(pipe_c);
+    /* event_fd is set to nonblocking during creation */
+    pipe_set_nonblocking(pipe_new);
+    pipe_set_nonblocking(pipe_term);
+#endif
 
-    conn_arr = ring_array_create(sizeof(struct buf_sock *), RING_ARRAY_DEFAULT_CAP);
-    if (conn_arr == NULL) {
-        log_error("core setup failed: could not allocate conn array");
+    conn_new = ring_array_create(sizeof(struct buf_sock *),
+            RING_ARRAY_DEFAULT_CAP);
+    conn_term = ring_array_create(sizeof(struct buf_sock *),
+            RING_ARRAY_DEFAULT_CAP);
+    if (conn_new == NULL || conn_term == NULL) {
+        log_error("core setup failed: could not allocate conn array(s)");
         goto error;
     }
 
@@ -223,7 +338,7 @@ core_server_setup(server_options_st *options, server_metrics_st *metrics)
     }
 
     hdl->accept = (channel_accept_fn)tcp_accept;
-    hdl->reject = (channel_reject_fn)tcp_reject;
+    hdl->reject = (channel_reject_fn)tcp_reject_all;
     hdl->open = (channel_open_fn)tcp_listen;
     hdl->term = (channel_term_fn)tcp_close;
     hdl->recv = (channel_recv_fn)tcp_recv;
@@ -259,6 +374,11 @@ core_server_setup(server_options_st *options, server_metrics_st *metrics)
     c->level = CHANNEL_META;
 
     event_add_read(ctx->evb, hdl->rid(c), server_sock);
+#ifdef USE_EVENT_FD
+    event_add_read(ctx->evb, efd_worker_to_server, NULL);
+#else
+    event_add_read(ctx->evb, pipe_read_id(pipe_term), NULL);
+#endif
 
     server_init = true;
 
@@ -280,8 +400,15 @@ core_server_teardown(void)
         freeaddrinfo(server_ai);
         buf_sock_return(&server_sock);
     }
-    ring_array_destroy(conn_arr);
-    pipe_conn_destroy(&pipe_c);
+    ring_array_destroy(&conn_term);
+    ring_array_destroy(&conn_new);
+#ifdef USE_EVENT_FD
+    close(efd_server_to_worker);
+    close(efd_worker_to_server);
+#else
+    pipe_conn_destroy(&pipe_new);
+    pipe_conn_destroy(&pipe_term);
+#endif
     server_metrics = NULL;
     server_init = false;
 }
@@ -298,7 +425,6 @@ _server_evwait(void)
 
     INCR(server_metrics, server_event_loop);
     INCR_N(server_metrics, server_event_total, n);
-    time_update();
 
     return CC_OK;
 }

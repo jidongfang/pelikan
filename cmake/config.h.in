@@ -12,11 +12,11 @@
 
 #cmakedefine HAVE_BACKTRACE
 
-#cmakedefine HAVE_BIG_ENDIAN
-
 #cmakedefine HAVE_LOGGING
 
 #cmakedefine HAVE_STATS
+
+#cmakedefine HAVE_ITT_INSTRUMENTATION
 
 #cmakedefine TARGET_SLIMCACHE
 

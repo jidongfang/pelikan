@@ -53,12 +53,29 @@ duration_reset(struct duration *d)
 }
 
 void
+duration_snapshot(struct duration *s, const struct duration *d)
+{
+    ASSERT(s != 0 && d != NULL);
+
+    s->started = true;
+    s->start = d->start;
+    s->stopped = true;
+    s->stop = mach_absolute_time();
+}
+
+void
 duration_start(struct duration *d)
 {
     ASSERT(d != NULL);
 
     d->started = true;
     d->start = mach_absolute_time();
+}
+
+void
+duration_start_type(struct duration *d, enum duration_type type)
+{
+    duration_start(d);
 }
 
 void

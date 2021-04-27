@@ -6,6 +6,7 @@
 
 #include <cc_mm.h>
 #include <cc_print.h>
+#include <cc_stats_log.h>
 
 #define TWEMCACHE_ADMIN_MODULE_NAME "twemcache::admin"
 
@@ -31,7 +32,8 @@ admin_process_setup(void)
 
     nmetric_perslab = METRIC_CARDINALITY(perslab[0]);
     /* perslab metric size <(32 + 20)B, prefix/suffix 12B, total < 64 */
-    cap = MAX(nmetric, nmetric_perslab * SLABCLASS_MAX_ID) * METRIC_PRINT_LEN;
+    cap = MAX(nmetric, nmetric_perslab * SLABCLASS_MAX_ID) * METRIC_PRINT_LEN +
+        METRIC_END_LEN;
     buf = cc_alloc(cap);
     /* TODO: check return status of cc_alloc */
 
@@ -49,6 +51,9 @@ admin_process_teardown(void)
     admin_init = false;
 }
 
+/* TODO(yao): refactor slab stats reporting somewhere else?
+ * this is duplicated between twemcache and rds
+ */
 static void
 _admin_stats_slab(struct response *rsp, struct request *req)
 {
@@ -110,4 +115,12 @@ admin_process_request(struct response *rsp, struct request *req)
         rsp->type = RSP_INVALID;
         break;
     }
+}
+
+void
+stats_dump(void *arg)
+{
+    procinfo_update();
+    stats_log((struct metric *)&stats, nmetric);
+    stats_log_flush();
 }

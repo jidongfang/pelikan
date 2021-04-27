@@ -5,18 +5,19 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-static rel_time_t flush_at = 0;
+extern delta_time_i max_ttl;
+proc_time_i flush_at = -1;
 
 static inline bool
 _item_expired(struct item *it)
 {
-    return ((it->expire_at > 0 && it->expire_at < time_now())
-            || (it->create_at <= flush_at));
+    return (it->expire_at < time_proc_sec() || it->create_at <= flush_at);
 }
 
 static inline void
 _copy_key_item(struct item *nit, struct item *oit)
 {
+    nit->olen = oit->olen;
     cc_memcpy(item_key(nit), item_key(oit), oit->klen);
     nit->klen = oit->klen;
 }
@@ -41,8 +42,8 @@ _item_reset(struct item *it)
     it->in_freeq = 0;
     it->is_raligned = 0;
     it->vlen = 0;
-    it->dataflag = 0;
     it->klen = 0;
+    it->olen = 0;
     it->expire_at = 0;
     it->create_at = 0;
 }
@@ -53,10 +54,10 @@ _item_reset(struct item *it)
  *
  * On success we return the pointer to the allocated item.
  */
-static item_rstatus_t
-_item_alloc(struct item **it_p, uint8_t klen, uint32_t vlen)
+static item_rstatus_e
+_item_alloc(struct item **it_p, uint8_t klen, uint32_t vlen, uint8_t olen)
 {
-    uint8_t id = slab_id(item_ntotal(klen, vlen));
+    uint8_t id = slab_id(item_ntotal(klen, vlen, olen));
     struct item *it;
 
     log_verb("allocate item with klen %u vlen %u", klen, vlen);
@@ -97,33 +98,44 @@ _item_dealloc(struct item **it_p)
     PERSLAB_DECR(id, item_curr);
 
     slab_put_item(*it_p, id);
+    cc_itt_free(slab_free, *it_p);
     *it_p = NULL;
 }
 
 /*
- * Link an item into the hash table
+ * (Re)Link an item into the hash table
  */
 static void
-_item_link(struct item *it)
+_item_link(struct item *it, bool relink)
 {
     ASSERT(it->magic == ITEM_MAGIC);
-    ASSERT(!(it->is_linked));
     ASSERT(!(it->in_freeq));
+
+    if (!relink) {
+        ASSERT(!(it->is_linked));
+
+        it->is_linked = 1;
+        slab_deref(item_to_slab(it)); /* slab ref'ed in _item_alloc */
+    }
 
     log_verb("link it %p of id %"PRIu8" at offset %"PRIu32, it, it->id,
             it->offset);
-
-    it->is_linked = 1;
-    slab_deref(item_to_slab(it)); /* slab ref'ed in _item_alloc */
 
     hashtable_put(it, hash_table);
 
     INCR(slab_metrics, item_linked_curr);
     INCR(slab_metrics, item_link);
+    /* TODO(yao): how do we track optional storage? Separate or treat as val? */
     INCR_N(slab_metrics, item_keyval_byte, it->klen + it->vlen);
     INCR_N(slab_metrics, item_val_byte, it->vlen);
     PERSLAB_INCR_N(it->id, item_keyval_byte, it->klen + it->vlen);
     PERSLAB_INCR_N(it->id, item_val_byte, it->vlen);
+}
+
+void
+item_relink(struct item *it)
+{
+    _item_link(it, true);
 }
 
 void
@@ -133,9 +145,11 @@ item_insert(struct item *it, const struct bstring *key)
 
     item_delete(key);
 
-    _item_link(it);
+    _item_link(it, false);
     log_verb("insert it %p of id %"PRIu8" for key %.*s", it, it->id, key->len,
         key->data);
+
+    cc_itt_alloc(slab_malloc, it, item_size(it));
 }
 
 /*
@@ -193,35 +207,41 @@ item_get(const struct bstring *key)
 
 /* TODO(yao): move this to memcache-specific location */
 static void
-_item_define(struct item *it, const struct bstring *key, const struct bstring *val, uint32_t dataflag, rel_time_t expire_at)
+_item_define(struct item *it, const struct bstring *key, const struct bstring
+        *val, uint8_t olen, proc_time_i expire_at)
 {
-    it->create_at = time_now();
-    it->expire_at = expire_at;
-    it->dataflag = dataflag;
+    proc_time_i expire_cap = time_delta2proc_sec(max_ttl);
+
+    it->create_at = time_proc_sec();
+    it->expire_at = expire_at < expire_cap ? expire_at : expire_cap;
     item_set_cas(it);
+    it->olen = olen;
     cc_memcpy(item_key(it), key->data, key->len);
     it->klen = key->len;
-    cc_memcpy(item_data(it), val->data, val->len);
-    it->vlen = val->len;
+    if (val != NULL) {
+        cc_memcpy(item_data(it), val->data, val->len);
+    }
+    it->vlen = (val == NULL) ? 0 : val->len;
 }
 
-item_rstatus_t
-item_reserve(struct item **it_p, const struct bstring *key, const struct bstring *val, uint32_t vlen, uint32_t dataflag, rel_time_t expire_at)
+item_rstatus_e
+item_reserve(struct item **it_p, const struct bstring *key, const struct bstring
+        *val, uint32_t vlen, uint8_t olen, proc_time_i expire_at)
 {
-    item_rstatus_t status;
+    item_rstatus_e status;
     struct item *it;
 
-    if ((status = _item_alloc(it_p, key->len, vlen)) != ITEM_OK) {
+    if ((status = _item_alloc(it_p, key->len, vlen, olen)) != ITEM_OK) {
         log_debug("item reservation failed");
         return status;
     }
 
     it = *it_p;
 
-    _item_define(it, key, val, dataflag, expire_at);
+    _item_define(it, key, val, olen, expire_at);
 
-    log_verb("reserve it %p of id %"PRIu8" for key '%.*s' dataflag %u", it,
-            it->id, key->len, key->data, it->dataflag);
+    log_verb("reserve it %p of id %"PRIu8" for key '%.*s' optional len %"PRIu8,
+            it, it->id,key->len, key->data, olen);
 
     return ITEM_OK;
 }
@@ -245,15 +265,16 @@ item_backfill(struct item *it, const struct bstring *val)
             it, val->len, it->vlen);
 }
 
-item_rstatus_t
-item_annex(struct item *oit, const struct bstring *key, const struct bstring *val, bool append)
+item_rstatus_e
+item_annex(struct item *oit, const struct bstring *key, const struct bstring
+        *val, bool append)
 {
-    item_rstatus_t status = ITEM_OK;
+    item_rstatus_e status = ITEM_OK;
     struct item *nit = NULL;
     uint8_t id;
     uint32_t ntotal = oit->vlen + val->len;
 
-    id = item_slabid(oit->klen, ntotal);
+    id = item_slabid(oit->klen, ntotal, oit->olen);
     if (id == SLABCLASS_INVALID_ID) {
         log_info("client error: annex operation results in oversized item with"
                    "key size %"PRIu8" old value size %"PRIu32" and new value "
@@ -275,15 +296,14 @@ item_annex(struct item *oit, const struct bstring *key, const struct bstring *va
             INCR_N(slab_metrics, item_val_byte, val->len);
             item_set_cas(oit);
         } else {
-            status = _item_alloc(&nit, oit->klen, ntotal);
+            status = _item_alloc(&nit, oit->klen, ntotal, oit->olen);
             if (status != ITEM_OK) {
                 log_debug("annex failed due to failure to allocate new item");
                 return status;
             }
             _copy_key_item(nit, oit);
             nit->expire_at = oit->expire_at;
-            nit->create_at = time_now();
-            nit->dataflag = oit->dataflag;
+            nit->create_at = time_proc_sec();
             item_set_cas(nit);
             /* value is left-aligned */
             cc_memcpy(item_data(nit), item_data(oit), oit->vlen);
@@ -304,15 +324,14 @@ item_annex(struct item *oit, const struct bstring *key, const struct bstring *va
             INCR_N(slab_metrics, item_val_byte, val->len);
             item_set_cas(oit);
         } else {
-            status = _item_alloc(&nit, oit->klen, ntotal);
+            status = _item_alloc(&nit, oit->klen, ntotal, oit->olen);
             if (status != ITEM_OK) {
                 log_debug("annex failed due to failure to allocate new item");
                 return status;
             }
             _copy_key_item(nit, oit);
             nit->expire_at = oit->expire_at;
-            nit->create_at = time_now();
-            nit->dataflag = oit->dataflag;
+            nit->create_at = time_proc_sec();
             item_set_cas(nit);
             /* value is right-aligned */
             nit->is_raligned = 1;
@@ -332,7 +351,7 @@ item_annex(struct item *oit, const struct bstring *key, const struct bstring *va
 void
 item_update(struct item *it, const struct bstring *val)
 {
-    ASSERT(item_slabid(it->klen, val->len) == it->id);
+    ASSERT(item_slabid(it->klen, val->len, it->olen) == it->id);
 
     it->vlen = val->len;
     cc_memcpy(item_data(it), val->data, val->len);
@@ -369,6 +388,43 @@ void
 item_flush(void)
 {
     time_update();
-    flush_at = time_now();
+    flush_at = time_proc_sec();
     log_info("all keys flushed at %"PRIu32, flush_at);
 }
+
+/* this dumps all keys (matching a prefix if given) regardless of expiry status */
+size_t
+item_expire(struct bstring *prefix)
+{
+    uint32_t nbucket = HASHSIZE(hash_table->hash_power);
+    size_t nkey, klen, vlen;
+
+    log_info("start scanning all %"PRIu32" keys", hash_table->nhash_item);
+
+    nkey = 0;
+    for (uint32_t i = 0; i < nbucket; i++) {
+        struct item_slh *entry = &hash_table->table[i];
+        struct item *it;
+
+        SLIST_FOREACH(it, entry, i_sle) {
+            klen = it->klen;
+            vlen = it->vlen;
+            if (klen >= prefix->len &&
+                    cc_bcmp(prefix->data, item_key(it), prefix->len) == 0) {
+                nkey++;
+                it->expire_at = time_proc_sec();
+                log_verb("item %p flushed at %"PRIu32, it, it->expire_at);
+            }
+        }
+
+        if (i % 1000000 == 0) {
+            log_info("... %"PRIu32" out of %"PRIu32" buckets scanned ...", i,
+                    nbucket);
+        }
+    }
+
+    log_info("finish scanning all keys");
+
+    return nkey;
+}
+

@@ -36,6 +36,7 @@ response_reset(struct response *rsp)
     rsp->vcas = 0;
     rsp->met = NULL;
     rsp->flag = 0;
+    rsp->item = NULL;
 
     rsp->cas = 0;
     rsp->num = 0;
@@ -163,7 +164,6 @@ response_return_all(struct response **response)
 
     struct response *nr, *rsp = *response;
 
-    nr = STAILQ_NEXT(rsp, next);
     while (rsp != NULL) {
         nr = STAILQ_NEXT(rsp, next);
         response_return(&rsp);

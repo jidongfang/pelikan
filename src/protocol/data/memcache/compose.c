@@ -48,7 +48,7 @@ compose_teardown(void)
  * common functions
  */
 
-static inline compose_rstatus_t
+static inline compose_rstatus_e
 _check_buf_size(struct buf **buf, uint32_t n)
 {
     while (n > buf_wsize(*buf)) {
@@ -117,7 +117,7 @@ _noreply(struct buf **buf)
 }
 
 int
-compose_req(struct buf **buf, struct request *req)
+compose_req(struct buf **buf, const struct request *req)
 {
     request_type_t type = req->type;
     struct bstring *str = &req_strings[type];
@@ -236,7 +236,7 @@ error:
  */
 
 int
-compose_rsp(struct buf **buf, struct response *rsp)
+compose_rsp(struct buf **buf, const struct response *rsp)
 {
     int n = 0;
     uint32_t vlen;

@@ -1,11 +1,13 @@
 #include "process.h"
 
+#include "hotkey/hotkey.h"
 #include "protocol/data/memcache_include.h"
 #include "storage/slab/slab.h"
 
 #include <cc_array.h>
 #include <cc_debug.h>
 #include <cc_print.h>
+#include <time/cc_timer.h>
 
 #define TWEMCACHE_PROCESS_MODULE_NAME "twemcache::process"
 
@@ -15,15 +17,56 @@
 #define CMD_ERR_MSG         "command not supported"
 #define OTHER_ERR_MSG       "unknown server error"
 
+
 typedef enum put_rstatus {
     PUT_OK,
     PUT_PARTIAL,
     PUT_ERROR,
-} put_rstatus_t;
+} put_rstatus_e;
 
 static bool process_init = false;
 static process_metrics_st *process_metrics = NULL;
 static bool allow_flush = ALLOW_FLUSH;
+static bool prefill = PREFILL;
+static uint32_t prefill_ksize;
+static char prefill_kbuf[UINT8_MAX]; /* slab implementation has klen as unint8_t */
+static uint32_t prefill_vsize;
+/* val_buf size is arbitrary , update if want to warm up with larger objects */
+static char prefill_vbuf[ITEM_SIZE_MAX];
+static uint64_t prefill_nkey;
+
+static void
+_prefill_slab(void)
+{
+    struct duration d;
+    struct bstring key, val;
+    item_rstatus_e istatus;
+    struct item *it;
+
+    duration_reset(&d);
+    key.len = prefill_ksize;
+    key.data = prefill_kbuf;
+    val.len = prefill_vsize;
+    val.data = prefill_vbuf;
+
+    duration_start(&d);
+    for (uint32_t i = 0; i < prefill_nkey; ++i) {
+        /* print fixed-length key with leading 0's for padding */
+        cc_snprintf(&prefill_kbuf, key.len + 1, "%.*d", key.len, i);
+        /* fill val, use the same value as key for now */
+        cc_snprintf(&prefill_vbuf, val.len + 1, "%.*d", val.len, i);
+        /* insert into slab/heap */
+        istatus = item_reserve(&it, &key, &val, val.len, DATAFLAG_SIZE,
+                time_convert_proc_sec((time_i)INT32_MAX));
+        ASSERT(istatus == ITEM_OK);
+        item_insert(it, &key);
+    }
+    duration_stop(&d);
+
+    log_info("prefilling slab with %"PRIu64" keys, of key len %"PRIu32" & val "
+            "len %"PRIu32", in %.3f seconds", prefill_nkey, prefill_ksize,
+            prefill_vsize, duration_sec(&d));
+}
 
 void
 process_setup(process_options_st *options, process_metrics_st *metrics)
@@ -39,6 +82,14 @@ process_setup(process_options_st *options, process_metrics_st *metrics)
 
     if (options != NULL) {
         allow_flush = option_bool(&options->allow_flush);
+        prefill = option_bool(&options->prefill);
+        prefill_ksize = (uint32_t)option_uint(&options->prefill_ksize);
+        prefill_vsize = (uint32_t)option_uint(&options->prefill_vsize);
+        prefill_nkey = (uint64_t)option_uint(&options->prefill_nkey);
+    }
+
+    if (prefill) {
+        _prefill_slab();
     }
 
     process_init = true;
@@ -57,6 +108,17 @@ process_teardown(void)
     process_init = false;
 }
 
+static inline uint32_t
+_get_dataflag(struct item *it)
+{
+    return *((uint32_t *)item_optional(it));
+}
+
+static inline void
+_set_dataflag(struct item *it, uint32_t flag)
+{
+    *((uint32_t *)item_optional(it)) = flag;
+}
 
 static bool
 _get_key(struct response *rsp, struct bstring *key)
@@ -67,10 +129,14 @@ _get_key(struct response *rsp, struct bstring *key)
     if (it != NULL) {
         rsp->type = RSP_VALUE;
         rsp->key = *key;
-        rsp->flag = item_flag(it);
+        rsp->flag = _get_dataflag(it);
         rsp->vcas = item_get_cas(it);
         rsp->vstr.len = it->vlen;
         rsp->vstr.data = item_data(it);
+
+        if (hotkey_enabled && hotkey_sample(key)) {
+            log_debug("hotkey detected: %.*s", key->len, key->data);
+        }
 
         log_verb("found key at %p, location %p", key, it);
         return true;
@@ -158,7 +224,7 @@ _process_delete(struct response *rsp, struct request *req)
 
 
 static void
-_error_rsp(struct response *rsp, item_rstatus_t status)
+_error_rsp(struct response *rsp, item_rstatus_e status)
 {
     INCR(process_metrics, process_ex);
 
@@ -191,21 +257,22 @@ _error_rsp(struct response *rsp, item_rstatus_t status)
  *   - PUT_OK
  *   - PUT_PARTIAL
  */
-static put_rstatus_t
-_put(item_rstatus_t *istatus, struct request *req)
+static put_rstatus_e
+_put(item_rstatus_e *istatus, struct request *req)
 {
-    put_rstatus_t status;
+    put_rstatus_e status;
     struct item *it = NULL;
 
     *istatus = ITEM_OK;
     if (req->first) { /* self-contained req */
         struct bstring *key = array_first(req->keys);
-        *istatus = item_reserve(&it, key, &req->vstr, req->vlen, req->flag,
-                time_reltime(req->expiry));
+        *istatus = item_reserve(&it, key, &req->vstr, req->vlen, DATAFLAG_SIZE,
+                time_convert_proc_sec((time_i)req->expiry));
         req->first = false;
         req->reserved = it;
     } else { /* backfill reserved item */
-        item_backfill(req->reserved, &req->vstr);
+        it = req->reserved;
+        item_backfill(it, &req->vstr);
     }
 
     if (!req->partial) {
@@ -217,6 +284,9 @@ _put(item_rstatus_t *istatus, struct request *req)
     if (status == PUT_ERROR) {
         req->swallow = true;
         req->serror = true;
+    }
+    if (status == PUT_OK) { /* set flag when put is complete */
+        _set_dataflag(it, req->flag);
     }
 
     return status;
@@ -231,8 +301,8 @@ _put(item_rstatus_t *istatus, struct request *req)
 static void
 _process_set(struct response *rsp, struct request *req)
 {
-    put_rstatus_t status;
-    item_rstatus_t istatus;
+    put_rstatus_e status;
+    item_rstatus_e istatus;
     struct item *it;
     struct bstring key;
 
@@ -261,8 +331,8 @@ _process_set(struct response *rsp, struct request *req)
 static void
 _process_add(struct response *rsp, struct request *req)
 {
-    put_rstatus_t status;
-    item_rstatus_t istatus;
+    put_rstatus_e status;
+    item_rstatus_e istatus;
     struct item *it;
     struct bstring key;
 
@@ -297,8 +367,8 @@ _process_add(struct response *rsp, struct request *req)
 static void
 _process_replace(struct response *rsp, struct request *req)
 {
-    put_rstatus_t status;
-    item_rstatus_t istatus;
+    put_rstatus_e status;
+    item_rstatus_e istatus;
     struct item *it = NULL;
     struct bstring key;
 
@@ -333,8 +403,8 @@ _process_replace(struct response *rsp, struct request *req)
 static void
 _process_cas(struct response *rsp, struct request *req)
 {
-    put_rstatus_t status;
-    item_rstatus_t istatus;
+    put_rstatus_e status;
+    item_rstatus_e istatus;
     struct item *it, *oit;
     struct bstring key;
 
@@ -375,11 +445,11 @@ _process_cas(struct response *rsp, struct request *req)
 /* get integer value of it */
 
 /* update item with integer value */
-static item_rstatus_t
+static item_rstatus_e
 _process_delta(struct response *rsp, struct item *it, struct request *req,
         struct bstring *key, bool incr)
 {
-    item_rstatus_t status;
+    item_rstatus_e status;
     uint32_t dataflag;
     uint64_t vint;
     struct bstring nval;
@@ -403,15 +473,16 @@ _process_delta(struct response *rsp, struct item *it, struct request *req,
     rsp->vint = vint;
     nval.len = cc_print_uint64_unsafe(buf, vint);
     nval.data = buf;
-    if (item_slabid(it->klen, nval.len) == it->id) {
+    if (item_slabid(it->klen, nval.len, it->olen) == it->id) {
         item_update(it, &nval);
         return ITEM_OK;
     }
 
-    dataflag = it->dataflag;
-    status = item_reserve(&it, key, &nval, nval.len, dataflag,
+    dataflag = _get_dataflag(it);
+    status = item_reserve(&it, key, &nval, nval.len, DATAFLAG_SIZE,
             it->expire_at);
     if (status == ITEM_OK) {
+        _set_dataflag(it, dataflag);
         item_insert(it, key);
     }
 
@@ -421,7 +492,7 @@ _process_delta(struct response *rsp, struct item *it, struct request *req,
 static void
 _process_incr(struct response *rsp, struct request *req)
 {
-    item_rstatus_t status;
+    item_rstatus_e status;
     struct bstring *key;
     struct item *it;
 
@@ -448,7 +519,7 @@ _process_incr(struct response *rsp, struct request *req)
 static void
 _process_decr(struct response *rsp, struct request *req)
 {
-    item_rstatus_t status;
+    item_rstatus_e status;
     struct bstring *key;
     struct item *it;
 
@@ -475,7 +546,7 @@ _process_decr(struct response *rsp, struct request *req)
 static void
 _process_append(struct response *rsp, struct request *req)
 {
-    item_rstatus_t status;
+    item_rstatus_e status;
     struct bstring *key;
     struct item *it;
 
@@ -505,7 +576,7 @@ _process_append(struct response *rsp, struct request *req)
 static void
 _process_prepend(struct response *rsp, struct request *req)
 {
-    item_rstatus_t status;
+    item_rstatus_e status;
     struct bstring *key;
     struct item *it;
 
@@ -535,12 +606,23 @@ _process_prepend(struct response *rsp, struct request *req)
 static void
 _process_flush(struct response *rsp, struct request *req)
 {
+    INCR(process_metrics, flush);
+
+    rsp->type = RSP_NUMERIC;
+    rsp->vint = item_expire(array_first(req->keys));
+
+    log_info("flush req %p processed, rsp type %d", req, rsp->type);
+}
+
+static void
+_process_flushall(struct response *rsp, struct request *req)
+{
     if (allow_flush) {
-        INCR(process_metrics, flush);
+        INCR(process_metrics, flushall);
         item_flush();
         rsp->type = RSP_OK;
 
-        log_info("flush req %p processed, rsp type %d", req, rsp->type);
+        log_info("flush_all req %p processed, rsp type %d", req, rsp->type);
     } else {
         rsp->type = RSP_CLIENT_ERROR;
         rsp->vstr = str2bstr(CMD_ERR_MSG);
@@ -602,6 +684,11 @@ process_request(struct response *rsp, struct request *req)
         _process_flush(rsp, req);
         break;
 
+    case REQ_FLUSHALL:
+        _process_flushall(rsp, req);
+        break;
+
+
     default:
         rsp->type = RSP_CLIENT_ERROR;
         rsp->vstr = str2bstr(CMD_ERR_MSG);
@@ -626,20 +713,23 @@ _cleanup(struct request *req, struct response *rsp)
 int
 twemcache_process_read(struct buf **rbuf, struct buf **wbuf, void **data)
 {
-    parse_rstatus_t status;
+    parse_rstatus_e status;
     struct request *req; /* data should be NULL or hold a req pointer */
     struct response *rsp;
 
     log_verb("post-read processing");
 
     /* deal with the stateful part: request and response */
-    req = (*data != NULL) ? *data : request_borrow();
-    if (req  == NULL) {
-        /* TODO(yao): simply return for now, better to respond with OOM */
-        log_error("cannot process request: OOM");
-        INCR(process_metrics, process_ex);
+    req = *data;
+    if (req == NULL) {
+        req = *data = request_borrow();
+        if (req == NULL) {
+            /* TODO(yao): simply return for now, better to respond with OOM */
+            log_error("cannot process request: OOM");
+            INCR(process_metrics, process_ex);
 
-        return -1;
+            return -1;
+        }
     }
     rsp = (req->rsp != NULL) ? req->rsp : response_borrow();
     if (rsp  == NULL) {
@@ -775,9 +865,11 @@ twemcache_process_error(struct buf **rbuf, struct buf **wbuf, void **data)
         if (req->reserved != NULL) {
             item_release((struct item **)&req->reserved);
         }
-        request_return(&req);
         response_return_all(&rsp);
+        request_return(&req);
     }
+
+    *data = NULL;
 
     return 0;
 }

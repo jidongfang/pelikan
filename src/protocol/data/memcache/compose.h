@@ -30,7 +30,7 @@ typedef enum compose_rstatus {
     COMPOSE_ENOMEM      = -2,
     COMPOSE_EINVALID    = -3,
     COMPOSE_EOTHER      = -4,
-} compose_rstatus_t;
+} compose_rstatus_e;
 
 struct request;
 struct response;
@@ -39,6 +39,6 @@ void compose_setup(compose_req_metrics_st *req, compose_rsp_metrics_st *rsp);
 void compose_teardown(void);
 
 /* if the return value is negative, it can be interpreted as compose_rstatus */
-int compose_req(struct buf **buf, struct request *req);
+int compose_req(struct buf **buf, const struct request *req);
 
-int compose_rsp(struct buf **buf, struct response *rsp);
+int compose_rsp(struct buf **buf, const struct response *rsp);
